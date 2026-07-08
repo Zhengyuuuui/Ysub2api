@@ -38,7 +38,7 @@ RUN if [ -n "${NPM_CONFIG_REGISTRY}" ]; then pnpm config set registry "${NPM_CON
 # Copy only that subtree to keep the build dependency minimal.
 COPY frontend/ ./
 COPY docs/legal/ /app/docs/legal/
-RUN pnpm run build
+RUN ./node_modules/.bin/vite build
 
 # -----------------------------------------------------------------------------
 # Stage 2: Backend Builder
