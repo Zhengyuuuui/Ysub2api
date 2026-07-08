@@ -1,0 +1,76 @@
+# syntax=docker/dockerfile:1
+
+# =============================================================================
+# Railway Backend-only Dockerfile
+# =============================================================================
+# Build context: backend/
+# Railway Root Directory must be /backend
+# =============================================================================
+
+ARG GOLANG_IMAGE=golang:1.26.4-alpine
+ARG ALPINE_IMAGE=alpine:3.21
+ARG GOPROXY=https://goproxy.cn,direct
+ARG GOSUMDB=sum.golang.google.cn
+
+FROM ${GOLANG_IMAGE} AS builder
+
+ARG VERSION=
+ARG COMMIT=railway
+ARG DATE
+ARG GOPROXY
+ARG GOSUMDB
+
+ENV GOPROXY=${GOPROXY}
+ENV GOSUMDB=${GOSUMDB}
+
+RUN apk add --no-cache git ca-certificates tzdata
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN VERSION_VALUE="${VERSION}" && \
+    if [ -z "${VERSION_VALUE}" ] && [ -f "./scripts/resolve-version.sh" ]; then VERSION_VALUE="$(sh ./scripts/resolve-version.sh || true)"; fi && \
+    if [ -z "${VERSION_VALUE}" ]; then VERSION_VALUE="railway"; fi && \
+    DATE_VALUE="${DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" && \
+    CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags="-s -w -X main.Version=${VERSION_VALUE} -X main.Commit=${COMMIT} -X main.Date=${DATE_VALUE} -X main.BuildType=release" \
+    -trimpath \
+    -o /app/sub2api \
+    ./cmd/server
+
+FROM ${ALPINE_IMAGE}
+
+RUN apk add --no-cache \
+    ca-certificates \
+    tzdata \
+    su-exec \
+    libpq \
+    zstd-libs \
+    lz4-libs \
+    krb5-libs \
+    libldap \
+    libedit \
+    && rm -rf /var/cache/apk/*
+
+RUN addgroup -g 1000 sub2api && \
+    adduser -u 1000 -G sub2api -s /bin/sh -D sub2api
+
+WORKDIR /app
+
+COPY --from=builder --chown=sub2api:sub2api /app/sub2api /app/sub2api
+COPY --from=builder --chown=sub2api:sub2api /app/resources /app/resources
+
+RUN mkdir -p /app/data && chown sub2api:sub2api /app/data
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD wget -q -T 5 -O /dev/null http://localhost:${SERVER_PORT:-8080}/health || exit 1
+
+USER sub2api
+
+CMD ["/app/sub2api"]
