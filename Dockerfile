@@ -141,6 +141,8 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD wget -q -T 5 -O /dev/null http://localhost:${SERVER_PORT:-8080}/health || exit 1
 
-# Run the application (entrypoint fixes /app/data ownership then execs as sub2api)
+# Run the application.
+# Sub2API setup wizard exits gracefully after installation and expects systemd to restart it.
+# Railway does not provide systemd, so we restart the process inside the container when it exits with code 0.
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
-CMD ["/app/sub2api"]
+CMD ["sh", "-c", "while true; do /app/sub2api; code=$?; echo \"sub2api exited with code $code\"; if [ \"$code\" -ne 0 ]; then exit \"$code\"; fi; echo \"sub2api requested graceful restart; restarting in 2 seconds...\"; sleep 2; done"]
