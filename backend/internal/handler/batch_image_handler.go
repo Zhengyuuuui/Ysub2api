@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -8,16 +9,19 @@ import (
 	"strings"
 
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 )
 
 type BatchImageHandler struct {
 	service  *service.BatchImagePublicService
 	download *service.BatchImageDownloadService
 	cleanup  *service.BatchImageCleanupService
+	openAI   *OpenAIGatewayHandler
 }
 
 func NewBatchImageHandler(service *service.BatchImagePublicService, download *service.BatchImageDownloadService, cleanup *service.BatchImageCleanupService) *BatchImageHandler {
@@ -35,12 +39,53 @@ func (h *BatchImageHandler) Submit(c *gin.Context) {
 		batchImageError(c, infraerrors.New(http.StatusUnauthorized, "API_KEY_REQUIRED", "API key is required"))
 		return
 	}
+	if !h.checkSecurityAuditBeforeSubmit(c, &req) {
+		return
+	}
 	got, err := h.service.Submit(c.Request.Context(), owner, req, c.GetHeader("Idempotency-Key"))
 	if err != nil {
 		batchImageError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, got)
+}
+
+func (h *BatchImageHandler) checkSecurityAuditBeforeSubmit(c *gin.Context, req *service.BatchImageSubmitRequest) bool {
+	if h == nil || h.openAI == nil || req == nil {
+		return true
+	}
+	apiKey, ok := middleware.GetAPIKeyFromContext(c)
+	if !ok || apiKey == nil {
+		batchImageError(c, infraerrors.New(http.StatusUnauthorized, "API_KEY_REQUIRED", "API key is required"))
+		return false
+	}
+	subject, ok := middleware.GetAuthSubjectFromContext(c)
+	if !ok {
+		batchImageError(c, infraerrors.New(http.StatusInternalServerError, "USER_CONTEXT_REQUIRED", "User context not found"))
+		return false
+	}
+	items := make([]map[string]string, 0, len(req.Items))
+	for _, item := range req.Items {
+		if prompt := strings.TrimSpace(item.Prompt); prompt != "" {
+			items = append(items, map[string]string{"prompt": prompt})
+		}
+	}
+	if len(items) == 0 {
+		return true
+	}
+	body, err := json.Marshal(map[string]any{"request": map[string]any{"items": items}})
+	if err != nil {
+		batchImageError(c, infraerrors.New(http.StatusBadRequest, "INVALID_BATCH_PROMPT", "batch prompts are invalid"))
+		return false
+	}
+	reqLog := requestLogger(c, "handler.batch_image.security_audit",
+		zap.Int64("user_id", subject.UserID), zap.Int64("api_key_id", apiKey.ID), zap.String("model", req.Model))
+	decision := h.openAI.checkSecurityAudit(c, reqLog, apiKey, subject, service.ContentModerationProtocolOpenAIImages, req.Model, body)
+	if decision != nil && !decision.AllowNextStage {
+		h.openAI.openAISecurityAuditError(c, decision)
+		return false
+	}
+	return true
 }
 
 func (h *BatchImageHandler) Get(c *gin.Context) {
@@ -160,7 +205,18 @@ func (h *BatchImageHandler) ItemContent(c *gin.Context) {
 	if _, err := io.Copy(c.Writer, stream.Reader); err != nil {
 		return
 	}
-	_ = h.service.MarkDownloaded(c.Request.Context(), owner, c.Param("id"))
+	h.markDownloadedBestEffort(c, owner)
+}
+
+// markDownloadedBestEffort 在响应体已写出后标记下载状态；
+// 此时无法再向客户端返回错误，失败只能记日志（不能静默丢弃）。
+func (h *BatchImageHandler) markDownloadedBestEffort(c *gin.Context, owner service.BatchImageOwner) {
+	if err := h.service.MarkDownloaded(c.Request.Context(), owner, c.Param("id")); err != nil {
+		logger.L().Warn("batch_image.mark_downloaded_failed",
+			zap.String("batch_id", c.Param("id")),
+			zap.Error(err),
+		)
+	}
 }
 
 func (h *BatchImageHandler) Download(c *gin.Context) {
@@ -186,7 +242,7 @@ func (h *BatchImageHandler) Download(c *gin.Context) {
 		}
 		return
 	}
-	_ = h.service.MarkDownloaded(c.Request.Context(), owner, c.Param("id"))
+	h.markDownloadedBestEffort(c, owner)
 }
 
 func (h *BatchImageHandler) DeleteRecord(c *gin.Context) {
